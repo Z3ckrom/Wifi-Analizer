@@ -1,0 +1,181 @@
+import subprocess
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+import random
+# -------------------------
+# Interface auto-pick
+# -------------------------
+def get_wifi_interface(preferred="wlan1", fallback="wlan0"):
+   try:
+       res = subprocess.run(["iw", "dev"], capture_output=True, text=True)
+       interfaces = [
+           line.split()[1]
+           for line in res.stdout.splitlines()
+           if line.strip().startswith("Interface")
+       ]
+       if preferred in interfaces:
+           return preferred, f"Using external Wi-Fi interface: {preferred}"
+       elif fallback in interfaces:
+           return fallback, f"Using internal Wi-Fi interface: {fallback}"
+       elif interfaces:
+           # pick the first available if none of the defaults found
+           return interfaces[0], f"Using Wi-Fi interface: {interfaces[0]}"
+       else:
+           return None, "No Wi-Fi interfaces detected."
+   except Exception as e:
+       return None, f"Error detecting interfaces: {e}"
+# -------------------------
+# Frequency -> channel
+# -------------------------
+def freq_to_channel(freq):
+   """Convert frequency in MHz to Wi-Fi channel number."""
+   freq = int(freq)
+   # 2.4 GHz main channels
+   if 2412 <= freq <= 2472:
+       return (freq - 2407) // 5
+   # Channel 14 special case (2484 MHz)
+   elif freq == 2484:
+       return 14
+   # 5 GHz channels (common 5GHz range up to channel 165)
+   elif 5000 <= freq <= 6000:
+       return (freq - 5000) // 5
+   else:
+       return None
+# -------------------------
+# Select interface
+# -------------------------
+wifi_iface, iface_status = get_wifi_interface()
+if not wifi_iface:
+   print(iface_status)
+   # continue to create GUI to show the error, but scans will return no networks
+# -------------------------
+# Wi-Fi scanning (iw)
+# -------------------------
+def scan_wifi():
+   if not wifi_iface:
+       return []
+   try:
+       result = subprocess.check_output(["sudo", "iw", "dev", wifi_iface, "scan"], text=True)
+   except subprocess.CalledProcessError:
+       return []
+   except FileNotFoundError:
+       # 'iw' not installed
+       return []
+   selected_band = band_var.get()
+   cells = result.split("BSS ")
+   networks = []
+   for cell in cells:
+       ssid_match = re.search(r"SSID: (.*)", cell)
+       freq_match = re.search(r"freq: (\d+)", cell)
+       signal_match = re.search(r"signal: (-?\d+\.?\d*) dBm", cell)
+       # iw reports width in forms like "width: 20 MHz" or "channel width: 20 MHz"
+       width_match = re.search(r"channel width: (\d+)", cell) or re.search(r"width: (\d+)\s*MHz", cell)
+       if ssid_match and freq_match and signal_match:
+           ssid = ssid_match.group(1).strip()
+           if ssid == "":
+               ssid = "<hidden>"
+           freq = int(freq_match.group(1))
+           ch = freq_to_channel(freq)
+           signal = float(signal_match.group(1))
+           width = int(width_match.group(1)) if width_match else 20
+           # Band filters
+           if selected_band == "2.4" and not (1 <= (ch or 0) <= 14):
+               continue
+           if selected_band == "5" and (ch is None or ch < 30):
+               continue
+           color = "#" + "".join(random.choices("0123456789ABCDEF", k=6))
+           networks.append((ssid, ch, signal, color, width))
+   return networks
+# -------------------------
+# Curve functions
+# -------------------------
+def laplace(center, width_mhz=20, x_min=1, x_max=165, points=800):
+   x = np.linspace(x_min, x_max, points)
+   # sigma scales with channel width (20MHz baseline)
+   sigma = max(0.4, (width_mhz / 20.0) * 1.2)
+   y = np.exp(-0.5 * ((x - center) / sigma) ** 2)
+   return x, y
+# -------------------------
+# Plotter
+# -------------------------
+def plot_networks(networks, canvas_frame):
+   fig, ax = plt.subplots(figsize=(10, 6))
+   ax.set_facecolor("black")
+   band = band_var.get()
+   ax.set_title(f"Wi-Fi Channel Overlap ({band} GHz)", fontsize=10, color="white")
+   for ssid, ch, strength, color, width in networks:
+       if ch is None:
+           continue
+       # Clamp strength and convert to dBm plotting range
+       strength = max(-100.0, min(-30.0, float(strength)))
+       # Choose x-range based on band for performance/readability
+       if band == "2.4":
+           x_min, x_max, points = 1, 14, 400
+       else:
+           x_min, x_max, points = 30, 165, 800
+       x, y = laplace(ch, width_mhz=width, x_min=x_min, x_max=x_max, points=points)
+       # Map normalized y (0..1) into dBm range (-100..-30) with peak at `strength`
+       curve_depth = 30
+       y_dbm = strength - (1 - y) * curve_depth
+       ax.fill_between(x, y_dbm, -100, color=color, alpha=0.55)
+       # place label slightly above peak
+       peak_y = (np.max(y_dbm))
+       ax.text(ch, peak_y + 1.5, f"{ssid} ({width}MHz)", color="white", ha="center", va="bottom", fontsize=8,
+               bbox=dict(facecolor=color, alpha=0.25, edgecolor="none"))
+   # Axis setup
+   if band == "2.4":
+       ax.set_xlim(0.5, 13.5)
+       ax.set_xticks(range(1, 14))
+   else:
+       ax.set_xlim(30, 165)
+       ax.set_xticks(range(30, 166, 10))
+   ax.set_ylim(-100, -30)
+   ax.set_yticks(range(-100, -20, 10))
+   ax.set_xlabel("Wi-Fi Channel", fontsize=9, color="white")
+   ax.set_ylabel("Signal Strength (dBm)", fontsize=9, color="white")
+   ax.tick_params(colors="white")
+   ax.grid(True, color="gray", alpha=0.25)
+   for w in canvas_frame.winfo_children():
+       w.destroy()
+   canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
+   canvas.draw()
+   canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+# -------------------------
+# Refresh + Auto-refresh
+# -------------------------
+def refresh():
+   networks = scan_wifi()
+   plot_networks(networks, canvas_frame)
+   # schedule next refresh (ms)
+   interval = int(refresh_var.get()) * 1000
+   root.after(interval, refresh)
+# -------------------------
+# GUI
+# -------------------------
+root = tk.Tk()
+root.title("Wi-Fi Analyzer")
+root.geometry("1000x650")
+band_var = tk.StringVar(value="2.4")
+refresh_var = tk.StringVar(value="5")  # seconds
+# Controls
+ctrl_frame = tk.Frame(root)
+ctrl_frame.pack(pady=6)
+tk.Label(ctrl_frame, text="Wi-Fi Band:").grid(row=0, column=0, padx=6)
+tk.Radiobutton(ctrl_frame, text="2.4 GHz", variable=band_var, value="2.4").grid(row=0, column=1)
+tk.Radiobutton(ctrl_frame, text="5 GHz", variable=band_var, value="5").grid(row=0, column=2)
+tk.Label(ctrl_frame, text="Refresh (sec):").grid(row=0, column=3, padx=6)
+tk.OptionMenu(ctrl_frame, refresh_var, "2", "5", "10", "20").grid(row=0, column=4)
+scan_btn = tk.Button(ctrl_frame, text="Force Scan Now", command=refresh)
+scan_btn.grid(row=0, column=5, padx=8)
+# Interface status
+iface_label = tk.Label(root, text=iface_status, fg="green" if wifi_iface else "red")
+iface_label.pack(pady=4)
+# Canvas
+canvas_frame = tk.Frame(root, bg="black")
+canvas_frame.pack(fill=tk.BOTH, expand=True)
+# Start
+root.after(200, refresh)  # slight delay to let GUI render first
+root.mainloop()
