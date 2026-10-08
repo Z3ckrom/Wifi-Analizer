@@ -35,3 +35,6 @@ def main() -> None:
     
     # Display the GUI
     root.mainloop()
+
+if __name__ == "__main__":
+    main()
