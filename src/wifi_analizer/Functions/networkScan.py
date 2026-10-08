@@ -4,8 +4,10 @@ import random
 # -------------------------
 # Wi-Fi Scanning (Windows)
 # -------------------------
-def scan_wifi_win(band_var):
+def scan_wifi_win(band_var: str):
+    # A string that tells what band we are looking for.
     selected_band = band_var
+    # An array of networks from the Selected wifi band the user put
     networks = []
     try:
         out = subprocess.check_output(
@@ -35,11 +37,3 @@ def scan_wifi_win(band_var):
             color = "#" + "".join(random.choices("0123456789ABCDEF", k=6))
             networks.append((ssid, ch, dbm, color, 20))
     return networks
-
-def refresh(band_var):
-   networks = scan_wifi_win(band_var)
-   print(networks)
-#    plot_networks(networks, canvas_frame)
-   # schedule next refresh (ms)
-#    interval = int(refresh_var.get()) * 1000
-#    root.after(interval, refresh)
