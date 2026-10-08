@@ -230,19 +230,19 @@ def plot_networks(networks, canvas_frame):
 # -------------------------
 # Refresh + Auto-refresh
 # -------------------------
-# def refresh():
-#    networks = scan_wifi_win()
-#    plot_networks(networks, canvas_frame)
-#    # schedule next refresh (ms)
-#    interval = int(refresh_var.get()) * 1000
-#    root.after(interval, refresh)
-after_id = None
 def refresh():
-    global after_id
-    if after_id is not None:
-        root.after_cancel(after_id)
-    start_scan()
-    after_id = root.after(int(refresh_var.get()) * 1000, refresh)
+   networks = scan_wifi_win()
+   plot_networks(networks, canvas_frame)
+   # schedule next refresh (ms)
+   interval = int(refresh_var.get()) * 1000
+   root.after(interval, refresh)
+after_id = None
+# def refresh():
+#     global after_id
+#     if after_id is not None:
+#         root.after_cancel(after_id)
+#     start_scan()
+#     after_id = root.after(int(refresh_var.get()) * 1000, refresh)
 
 
 # -------------------------

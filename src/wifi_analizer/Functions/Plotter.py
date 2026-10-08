@@ -54,5 +54,5 @@ def plot_networks(fig, ax, networks, canvas_frame, band_var):
    for w in canvas_frame.winfo_children():
        w.destroy()
    canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
-   canvas.draw()
+   canvas.draw_idle()
    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
