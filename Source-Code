@@ -5,6 +5,9 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import tkinter as tk
 import random
+import threading
+import queue
+from matplotlib.figure import Figure
 # -------------------------
 # Interface auto-pick
 # -------------------------
@@ -138,8 +141,13 @@ def laplace(center, width_mhz=20, x_min=1, x_max=165, points=800):
 # -------------------------
 # Plotter
 # -------------------------
+current_fig = None
 def plot_networks(networks, canvas_frame):
+   global current_fig
+   if current_fig is not None:
+        plt.close(current_fig)
    fig, ax = plt.subplots(figsize=(10, 6))
+   current_fig = fig
    ax.set_facecolor("black")
    band = band_var.get()
    ax.set_title(f"Wi-Fi Channel Overlap ({band} GHz)", fontsize=10, color="white")
