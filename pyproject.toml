@@ -8,6 +8,9 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
+    "comtypes>=1.4.17",
+    "matplotlib>=3.11.2",
+    "pywifi>=1.1.12",
     "requests>=2.34.2",
     "rich>=15.0.0",
 ]

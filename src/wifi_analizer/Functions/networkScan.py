@@ -1,6 +1,4 @@
-import subprocess
-import re
-import random
+import subprocess, re, random, pywifi
 # -------------------------
 # Wi-Fi Scanning (Windows)
 # -------------------------
@@ -9,6 +7,10 @@ def scan_wifi_win(band_var: str):
     selected_band = band_var
     # An array of networks from the Selected wifi band the user put
     networks = []
+    wifi = pywifi.PyWiFi()
+    interface = wifi.interfaces()[0]
+    # Force your wifi card to scan every time for latest
+    interface.scan()
     try:
         out = subprocess.check_output(
             ["netsh", "wlan", "show", "networks", "mode=bssid"],
