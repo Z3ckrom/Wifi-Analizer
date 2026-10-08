@@ -15,9 +15,8 @@ def laplace(center, width_mhz=20, x_min=1, x_max=165, points=800):
 # -------------------------
 # Plotter
 # -------------------------
-def plot_networks(networks, canvas_frame, band_var):
-   fig, ax = plt.subplots(figsize=(10, 6))
-   ax.set_facecolor("black")
+def plot_networks(fig, ax, networks, canvas_frame, band_var):
+   ax.clear()
    band = band_var
    ax.set_title(f"Wi-Fi Channel Overlap ({band} GHz)", fontsize=10, color="white")
    for ssid, ch, strength, color, width in networks:
