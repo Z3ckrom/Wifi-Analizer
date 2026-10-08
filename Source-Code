@@ -8,6 +8,45 @@ import random
 import threading
 import queue
 from matplotlib.figure import Figure
+
+result_queue = queue.Queue()
+scan_running = False   # prevents overlapping scans
+
+# SCANNER = scan_wifi_win if platform.system() == "Windows" else scan_wifi
+
+def poll_queue():
+    global scan_running
+    try:
+        networks = result_queue.get_nowait()
+    except queue.Empty:
+        pass
+    else:
+        scan_running = False
+        plot_networks(networks, canvas_frame)      # safe: we're on the main thread
+    root.after(100, poll_queue)
+
+def scan_worker(band):
+    """Runs in a background thread. No GUI calls allowed here."""
+    try:
+        networks = scan_wifi_win(band)
+    except Exception:
+        networks = []
+    result_queue.put(networks)
+
+
+# -------------------------
+# Interface auto-pick
+# -------------------------
+
+def start_scan():
+    global scan_running
+    if scan_running:
+        return                      # a scan is already in progress
+    scan_running = True
+    band = band_var.get()           # read GUI value in the MAIN thread
+    threading.Thread(target=scan_worker, args=(band,), daemon=True).start()
+
+
 # -------------------------
 # Interface auto-pick
 # -------------------------
@@ -98,7 +137,7 @@ def scan_wifi():
 # -------------------------
 # Wi-Fi Scanning (Windows)
 # -------------------------
-def scan_wifi_win():
+def scan_wifi_win(selected_band):
     try:
         out = subprocess.check_output(
             ["netsh", "wlan", "show", "networks", "mode=bssid"],
@@ -106,7 +145,7 @@ def scan_wifi_win():
     except Exception:
         return []
 
-    selected_band = band_var.get()
+    # selected_band = band_var.get()
     networks = []
     # split into per-SSID blocks
     for block in re.split(r"\n(?=SSID \d+ :)", out):
@@ -191,12 +230,21 @@ def plot_networks(networks, canvas_frame):
 # -------------------------
 # Refresh + Auto-refresh
 # -------------------------
+# def refresh():
+#    networks = scan_wifi_win()
+#    plot_networks(networks, canvas_frame)
+#    # schedule next refresh (ms)
+#    interval = int(refresh_var.get()) * 1000
+#    root.after(interval, refresh)
+after_id = None
 def refresh():
-   networks = scan_wifi_win()
-   plot_networks(networks, canvas_frame)
-   # schedule next refresh (ms)
-   interval = int(refresh_var.get()) * 1000
-   root.after(interval, refresh)
+    global after_id
+    if after_id is not None:
+        root.after_cancel(after_id)
+    start_scan()
+    after_id = root.after(int(refresh_var.get()) * 1000, refresh)
+
+
 # -------------------------
 # GUI
 # -------------------------
@@ -222,5 +270,8 @@ iface_label.pack(pady=4)
 canvas_frame = tk.Frame(root, bg="black")
 canvas_frame.pack(fill=tk.BOTH, expand=True)
 # Start
-root.after(200, refresh)  # slight delay to let GUI render first
+# root.after(200, refresh)  # slight delay to let GUI render first
+# root.mainloop()
+root.after(200, refresh)
+root.after(300, poll_queue)
 root.mainloop()
