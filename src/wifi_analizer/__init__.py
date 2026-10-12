@@ -1,4 +1,4 @@
-import threading, time
+import threading, time, queue
 from concurrent.futures import ProcessPoolExecutor
 import tkinter as tk
 from wifi_analizer.Functions.NetworkScan import scan_wifi_win
@@ -7,26 +7,38 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 iface_status = ""
 wifi_iface = True
+result_scan = queue.Queue()
 
 
 
-
-def getNetworkFeed(band_var):
-    return scan_wifi_win(band_var)
-    
+def getNetworkFeed():
+    # return scan_wifi_win(band_var.get())
+    try:
+        result_scan.put(("ok", scan_wifi_win(band_var.get())))
+    except Exception as e:
+        result_scan.put(("err", e))
     # root.after(int(refresh_var.get()) * 1000, lambda: getNetworkFeed(band_var, canvas_frame, fig, ax))
 
 def startGetNetworkFeed():
-    process = executor.submit(getNetworkFeed, band_var.get())
-    checkProcess(process)
+    # process = executor.submit(getNetworkFeed, band_var.get())
+    # checkProcess(process)
+    threading.Thread(target=getNetworkFeed, daemon=True).start()
+    root.after(100, checkProcess)
 
-def checkProcess(process):
-    if process.done():
-        print("done")
-        plot_networks(fig, ax, process.result(), canvas_frame ,band_var)
-        root.after(int(refresh_var.get()) * 1000, startGetNetworkFeed)
-    else:
-        root.after(100, checkProcess, process)
+def checkProcess():
+    try:
+        kind, value = result_scan.get_nowait()
+    except queue.Empty:
+        root.after(100, checkProcess)
+        return
+    if kind == "ok":
+        plot_networks(fig, ax, value, canvas_frame, band_var)
+    # if process.done():
+    #     print("done")
+    #     plot_networks(fig, ax, process.result(), canvas_frame ,band_var)
+    root.after(int(refresh_var.get()) * 1000, startGetNetworkFeed)
+    # else:
+    #     root.after(100, checkProcess, process)
         
 
 # -------------------------
