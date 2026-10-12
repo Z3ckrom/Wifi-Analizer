@@ -1,7 +1,7 @@
 import threading, time
 from concurrent.futures import ProcessPoolExecutor
 import tkinter as tk
-from wifi_analizer.Functions.NetworkScan import scan_wifi_win
+from wifi_analizer.Functions.NetworkScaner import scan_wifi_win
 from wifi_analizer.Functions.Plotter import plot_networks
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
