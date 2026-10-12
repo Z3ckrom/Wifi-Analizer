@@ -1,14 +1,14 @@
 import threading, time
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 import tkinter as tk
 from wifi_analizer.Functions.NetworkScaner import scan_wifi_win
 from wifi_analizer.Functions.Plotter import plot_networks
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
+
 iface_status = ""
 wifi_iface = True
-
-
 
 
 def getNetworkFeed(band_var):
@@ -22,7 +22,6 @@ def startGetNetworkFeed():
 
 def checkProcess(process):
     if process.done():
-        print("done")
         plot_networks(fig, ax, process.result(), canvas_frame ,band_var)
         root.after(int(refresh_var.get()) * 1000, startGetNetworkFeed)
     else:
@@ -56,8 +55,8 @@ def main() -> None:
     tk.Radiobutton(ctrl_frame, text="5 GHz", variable=band_var, value="5").grid(row=0, column=2)
     tk.Label(ctrl_frame, text="Refresh (sec):").grid(row=0, column=3, padx=6)
     tk.OptionMenu(ctrl_frame, refresh_var, "3", "6", "9", "12").grid(row=0, column=4)
-    scan_btn = tk.Button(ctrl_frame, text="Force Scan", command=startGetNetworkFeed)
-    scan_btn.grid(row=0, column=5, padx=8)
+    # scan_btn = tk.Button(ctrl_frame, text="Force Scan", command=startGetNetworkFeed)
+    # scan_btn.grid(row=0, column=5, padx=8)
     # Status
     iface_label = tk.Label(root, text=iface_status, fg="green" if wifi_iface else "red")
     iface_label.pack(pady=4)
@@ -68,6 +67,7 @@ def main() -> None:
     
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
     
 
