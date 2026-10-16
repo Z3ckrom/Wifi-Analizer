@@ -1,0 +1,211 @@
+import subprocess
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+import random
+import platform
+
+SSID_COLORS = {}
+
+
+def get_color(ssid):
+    if ssid not in SSID_COLORS:
+        random.seed(ssid)
+        SSID_COLORS[ssid] = '#'+''.join(random.choices('0123456789ABCDEF', k=6))
+    return SSID_COLORS[ssid]
+
+
+def get_wifi_interface(preferred='wlan1', fallback='wlan0'):
+    try:
+        res = subprocess.run(['iw','dev'], capture_output=True, text=True)
+        interfaces = [l.split()[1] for l in res.stdout.splitlines() if l.strip().startswith('Interface')]
+        if preferred in interfaces:
+            return preferred, f'Using external Wi‑Fi interface: {preferred}'
+        if fallback in interfaces:
+            return fallback, f'Using internal Wi‑Fi interface: {fallback}'
+        if interfaces:
+            return interfaces[0], f'Using Wi‑Fi interface: {interfaces[0]}'
+    except Exception:
+        pass
+    return None, 'No Wi‑Fi interface detected.'
+
+
+def freq_to_channel(freq):
+    freq = int(freq)
+    if 2412 <= freq <= 2472:
+        return (freq - 2407)//5
+    if freq == 2484:
+        return 14
+    if 5000 <= freq <= 6000:
+        return (freq - 5000)//5
+    return None
+
+
+def wifi_channel_shape(center,width_mhz=20,x_min=1,x_max=14,points=1200):
+    x = np.linspace(x_min,x_max,points)
+    half_width = max(1.5, width_mhz/10)
+    d = np.abs(x-center)
+    y = 1 - (d/half_width)**2
+    y[y < 0] = 0
+    y = y**0.75
+    return x,y
+
+
+wifi_iface, iface_status = get_wifi_interface()
+
+
+def scan_wifi_win():
+    try:
+        out = subprocess.check_output(['netsh','wlan','show','networks','mode=bssid'], text=True, encoding='utf-8', errors='ignore')
+    except Exception:
+        return []
+
+    networks=[]
+    band=band_var.get()
+
+    for block in re.split(r'(?=SSID \d+ :)', out):
+        m = re.match(r'SSID \d+ : (.*)', block)
+        if not m:
+            continue
+        ssid = m.group(1).strip() or '<hidden>'
+
+        for bss in re.split(r'\s*(?=BSSID \d+)', block)[1:]:
+            sig = re.search(r'Signal\s*:\s*(\d+)%', bss)
+            ch = re.search(r'Channel\s*:\s*(\d+)', bss)
+            if not (sig and ch):
+                continue
+
+            channel = int(ch.group(1))
+            rssi = int(sig.group(1))/2 - 100
+
+            if band == '2.4' and not (1 <= channel <= 14):
+                continue
+            if band == '5' and channel < 30:
+                continue
+
+            networks.append((ssid, channel, rssi, get_color(ssid), 20))
+    return networks
+
+
+def scan_wifi_linux():
+    if not wifi_iface:
+        return []
+    try:
+        result = subprocess.check_output(['sudo','iw','dev',wifi_iface,'scan'], text=True)
+    except Exception:
+        return []
+
+    networks=[]
+    band=band_var.get()
+
+    for cell in result.split('BSS '):
+        s=re.search(r'SSID: (.*)',cell)
+        f=re.search(r'freq: (\d+)',cell)
+        p=re.search(r'signal: (-?\d+\.?\d*) dBm',cell)
+        if not (s and f and p):
+            continue
+
+        ssid=s.group(1).strip() or '<hidden>'
+        ch=freq_to_channel(int(f.group(1)))
+        rssi=float(p.group(1))
+
+        if band == '2.4' and not (1 <= (ch or 0) <= 14):
+            continue
+        if band == '5' and (ch is None or ch < 30):
+            continue
+
+        networks.append((ssid,ch,rssi,get_color(ssid),20))
+
+    return networks
+
+
+def plot_networks(networks, canvas_frame):
+    fig, ax = plt.subplots(figsize=(12,7))
+    fig.patch.set_facecolor('#050B0F')
+    ax.set_facecolor('#050B0F')
+
+    band = band_var.get()
+
+    if band == '2.4':
+        x_min,x_max=0.5,14.5
+        channels=list(range(1,15))
+    else:
+        x_min,x_max=30,170
+        channels=[36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165]
+
+    for c in channels:
+        ax.axvline(c,color='#808080',alpha=0.18,linewidth=1,zorder=0)
+
+    for ssid,ch,rssi,color,width in networks:
+        if ch is None:
+            continue
+
+        x,y = wifi_channel_shape(ch,width,x_min,x_max)
+        y_dbm = rssi - ((1-y)*50)
+
+        ax.fill_between(x,y_dbm,-100,color=color,alpha=0.22,zorder=2)
+        ax.plot(x,y_dbm,color=color,linewidth=2.5,zorder=3)
+
+        ax.text(ch,np.max(y_dbm)+1,f'"{ssid}"',color=color,
+                fontsize=11,fontweight='bold',ha='center')
+
+    ax.set_xlim(x_min,x_max)
+    ax.set_xticks(channels)
+    ax.set_ylim(-100,-35)
+    ax.set_yticks([-100,-90,-80,-70,-60,-50,-40])
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position('right')
+    ax.set_ylabel('dBm',color='white')
+    ax.tick_params(colors='white',labelsize=12)
+
+    ax.grid(True,color='#666666',alpha=0.30)
+
+    ax.spines['top'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    ax.spines['bottom'].set_color('#AAAAAA')
+    ax.spines['right'].set_color('#AAAAAA')
+
+    ax.set_title(f'Wi‑Fi Analyzer - {band} GHz', color='white', fontsize=16)
+
+    for w in canvas_frame.winfo_children():
+        w.destroy()
+
+    canvas = FigureCanvasTkAgg(fig, master=canvas_frame)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+
+def refresh():
+    if platform.system() == 'Windows':
+        nets = scan_wifi_win()
+    else:
+        nets = scan_wifi_linux()
+
+    plot_networks(nets, canvas_frame)
+    root.after(int(refresh_var.get())*1000, refresh)
+
+
+root = tk.Tk()
+root.title('Wi‑Fi Analyzer')
+root.geometry('1200x750')
+
+band_var = tk.StringVar(value='2.4')
+refresh_var = tk.StringVar(value='5')
+
+ctrl = tk.Frame(root)
+ctrl.pack(pady=5)
+
+tk.Label(ctrl,text='Band').grid(row=0,column=0)
+tk.Radiobutton(ctrl,text='2.4 GHz',variable=band_var,value='2.4').grid(row=0,column=1)
+tk.Radiobutton(ctrl,text='5 GHz',variable=band_var,value='5').grid(row=0,column=2)
+
+tk.OptionMenu(ctrl,refresh_var,'2','5','10','20').grid(row=0,column=3)
+tk.Button(ctrl,text='Scan Now',command=refresh).grid(row=0,column=4)
+
+canvas_frame = tk.Frame(root,bg='black')
+canvas_frame.pack(fill=tk.BOTH,expand=True)
+
+root.after(250, refresh)
+root.mainloop()
