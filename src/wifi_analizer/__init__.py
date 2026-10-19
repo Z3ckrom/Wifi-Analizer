@@ -1,6 +1,6 @@
 import threading, time
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from wifi_analizer.Functions.NetworkScaner import scan_wifi_win
 from wifi_analizer.Functions.Plotter import plot_networks
@@ -8,16 +8,27 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
+
 iface_status = ""
 wifi_iface = True
-
+wifi_scan = True
+def toggle_scan():
+    global wifi_scan
+    if scan_btn["text"] == "Start Scans":
+        scan_btn.config(text="Stop Scans")
+        root.after(int(refresh_var.get()) * 1000, startGetNetworkFeed)
+        wifi_scan = True
+    else:
+        scan_btn.config(text="Start Scans")
+        wifi_scan = False        
 
 def getNetworkFeed(band_var):
     return scan_wifi_win(band_var)
 
 def startGetNetworkFeed():
-    process = executor.submit(getNetworkFeed, band_var.get())
-    checkProcess(process)
+    if wifi_scan:
+        process = executor.submit(getNetworkFeed, band_var.get())
+        checkProcess(process)
 
 def checkProcess(process):
     if process.done():
@@ -26,15 +37,17 @@ def checkProcess(process):
             root.after(int(refresh_var.get()) * 1000, startGetNetworkFeed)
     else:
         root.after(100, checkProcess, process)
+
+
         
 
 # -------------------------
 # UX Display
 # -------------------------
 def main() -> None:
-    global root, refresh_var, fig, ax, canvas_frame, band_var, executor, listOfNetworks, canvas
+    global root, refresh_var, fig, ax, canvas_frame, band_var, executor, listOfNetworks, canvas, scan_btn
     listOfNetworks = {}
-    executor = ProcessPoolExecutor()
+    executor = ThreadPoolExecutor(max_workers=5)
     root = tk.Tk()
     refresh_var = tk.StringVar(value="6")
     root.title("Wi-Fi Analyzer")
@@ -79,8 +92,8 @@ def main() -> None:
     tk.Radiobutton(ctrl_frame, text="5 GHz", variable=band_var, value="5").grid(row=0, column=2)
     tk.Label(ctrl_frame, text="Refresh (sec):").grid(row=0, column=3, padx=6)
     tk.OptionMenu(ctrl_frame, refresh_var, "3", "6", "9", "12").grid(row=0, column=4)
-    # scan_btn = tk.Button(ctrl_frame, text="Force Scan", command=startGetNetworkFeed)
-    # scan_btn.grid(row=0, column=5, padx=8)
+    scan_btn = tk.Button(ctrl_frame, text="Stop Scans", command=toggle_scan)
+    scan_btn.grid(row=0, column=5, padx=8)
     # Status
     iface_label = tk.Label(root, text=iface_status, fg="green" if wifi_iface else "red")
     iface_label.pack(pady=4)

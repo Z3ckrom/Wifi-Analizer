@@ -10,4 +10,4 @@ Then "uv run wifi-analizer"
 UV installs all the needed on uv run so no npm install.
 
 To make a EXE:
-uv run python -m PyInstaller --onefile --console --name wifi-analizer --paths src src/wifi_analizer/**init**.py
+uv run python -m PyInstaller --onefile --console --name wifi-analizer --paths src src/wifi_analizer/__init__.py
