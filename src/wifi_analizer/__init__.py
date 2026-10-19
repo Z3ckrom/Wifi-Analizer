@@ -83,14 +83,14 @@ def main() -> None:
     tk.Radiobutton(ctrl_frame, text="5 GHz", variable=band_var, value="5").grid(row=0, column=2)
     tk.Label(ctrl_frame, text="Refresh (sec):").grid(row=0, column=3, padx=6)
     tk.OptionMenu(ctrl_frame, refresh_var, "3", "6", "9", "12").grid(row=0, column=4)
-    scan_btn = tk.Button(ctrl_frame, text="Force Scan", command=startGetNetworkFeed)
-    scan_btn.grid(row=0, column=5, padx=8)
+    # scan_btn = tk.Button(ctrl_frame, text="Force Scan", command=startGetNetworkFeed)
+    # scan_btn.grid(row=0, column=5, padx=8)
     # Status
     iface_label = tk.Label(root, text=iface_status, fg="green" if wifi_iface else "red")
     iface_label.pack(pady=4)
     
     # Display the result as set up refresh
-    # root.after(200, startGetNetworkFeed)
+    root.after(200, startGetNetworkFeed)
     root.mainloop()
     
 
