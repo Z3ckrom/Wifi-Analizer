@@ -35,32 +35,36 @@ def plot_networks(fig, ax, networks, canvas_frame, band_var, listOfNetworks, can
 
     ax.clear()
 
-
+    global x_center
     if band_var == '2.4':
-            x_min,x_max=0.5,14.5
-            channels=list(range(1,15))
-            ax.set_xlim(x_min,x_max)
-            ax.set_xticks(channels)
+        x_min,x_max=0.5,14.5
+        channels=list(range(1,15))
+        ax.set_xlim(x_min,x_max)
+        ax.set_xticks(channels)
     else:
-        x_min,x_max=30,170
         channels=[36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165]
-        # ax.set_xlim(x_min,x_max)
+        x_min,x_max=0,len(channels) - 1
         ax.set_xticks(range(len(channels)))
         ax.set_xticklabels(channels)
         ax.set_xlim(-1, len(channels))
+        x_center = {ch: i for i, ch in enumerate(channels)}
+        
     for c in channels:
         ax.axvline(c,color='#808080',alpha=0.18,linewidth=1,zorder=0)
+    
     
     for ssid,ch,rssi,color,width in networks:
         if ch is None:
             continue
-    
+        if band_var != '2.4':
+            ch = x_center[ch]
         x,y = wifi_channel_shape(ch,width,x_min,x_max)
         y_dbm = rssi - ((1-y)*50)
-    
+        
+        
         ax.fill_between(x,y_dbm,-100,color=color,alpha=0.22,zorder=2)
         ax.plot(x,y_dbm,color=color,linewidth=2.5,zorder=3)
-    
+        
         ax.text(ch,np.max(y_dbm)+1,f'"{ssid}"',color=color,fontsize=11,fontweight='bold',ha='center')
         ax.set_facecolor('#050B0F')
         ax.set_ylim(-100,-35)

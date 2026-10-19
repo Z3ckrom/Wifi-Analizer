@@ -14,8 +14,6 @@ wifi_iface = True
 
 def getNetworkFeed(band_var):
     return scan_wifi_win(band_var)
-    
-    # root.after(int(refresh_var.get()) * 1000, lambda: getNetworkFeed(band_var, canvas_frame, fig, ax))
 
 def startGetNetworkFeed():
     process = executor.submit(getNetworkFeed, band_var.get())
@@ -24,9 +22,7 @@ def startGetNetworkFeed():
 def checkProcess(process):
     if process.done():
         if process.result(): 
-            print(process.result())
             plot_networks(fig, ax, process.result(), canvas_frame,band_var.get(), listOfNetworks, canvas)
-            
             root.after(int(refresh_var.get()) * 1000, startGetNetworkFeed)
     else:
         root.after(100, checkProcess, process)
@@ -42,7 +38,7 @@ def main() -> None:
     root = tk.Tk()
     refresh_var = tk.StringVar(value="6")
     root.title("Wi-Fi Analyzer")
-    root.geometry('1200x750')
+    root.geometry('1800x800')
     band_var = tk.StringVar(value="2.4")
     ctrl_frame = tk.Frame(root)
     ctrl_frame.pack(pady=6)
