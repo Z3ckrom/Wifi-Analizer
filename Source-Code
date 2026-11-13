@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-
 from __future__ import annotations
-
 import argparse
 import hashlib
 import math
 import platform
 import queue
-import random
 import re
 import shutil
 import subprocess
@@ -18,12 +15,9 @@ from collections import deque
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from typing import Iterable, Optional
-
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-
-
 @dataclass(frozen=True)
 class Network:
     ssid: str
@@ -32,19 +26,17 @@ class Network:
     rssi: float
     width: int = 20
     security: str = "Unknown"
-
+    # Windows and nmcli report quality percent rather than true RSSI. Preserve it
+    # so the Hunter can use the native measurement without pretending it is dBm.
+    signal_percent: Optional[float] = None
     @property
     def band(self) -> str:
         return "2.4" if 1 <= self.channel <= 14 else "5"
-
-
 @dataclass
 class ScanResult:
     networks: list[Network]
     status: str = ""
     error: str = ""
-
-
 def freq_to_channel(freq_mhz: int) -> Optional[int]:
     """Convert common 2.4/5/6 GHz center frequencies to channel numbers."""
     freq = int(freq_mhz)
@@ -57,29 +49,19 @@ def freq_to_channel(freq_mhz: int) -> Optional[int]:
     if 5955 <= freq <= 7115:
         return (freq - 5950) // 5
     return None
-
-
 def channel_band(channel: int) -> str:
     if 1 <= channel <= 14:
         return "2.4"
     if 30 <= channel <= 196:
         return "5"
     return "Other"
-
-
 def matches_band(channel: int, selected_band: str) -> bool:
     return selected_band == "All" or channel_band(channel) == selected_band
-
-
 def normalize_bssid(value: str) -> str:
     return value.strip().replace("-", ":").upper()
-
-
 def signal_percent_to_dbm(percent: float) -> float:
     """Use the conventional Windows quality approximation: dBm = quality/2 - 100."""
     return max(-100.0, min(-30.0, float(percent) / 2.0 - 100.0))
-
-
 def stable_color(key: str) -> str:
     digest = hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()
     # Keep colors bright enough to remain visible on a black plot.
@@ -87,8 +69,6 @@ def stable_color(key: str) -> str:
     g = 80 + int(digest[2:4], 16) * 175 // 255
     b = 80 + int(digest[4:6], 16) * 175 // 255
     return f"#{r:02X}{g:02X}{b:02X}"
-
-
 def deduplicate_networks(networks: Iterable[Network]) -> list[Network]:
     """Keep the strongest record for each BSSID and return a stable ordering."""
     by_bssid: dict[str, Network] = {}
@@ -97,19 +77,25 @@ def deduplicate_networks(networks: Iterable[Network]) -> list[Network]:
         if old is None or network.rssi > old.rssi:
             by_bssid[network.bssid] = network
     return sorted(by_bssid.values(), key=lambda n: (n.ssid.casefold(), n.bssid))
-
-
 class BaseScanner:
     description = "Wi-Fi scanner"
 
     def scan(self, selected_band: str) -> ScanResult:
         raise NotImplementedError
 
+    def scan_target(self, selected_band: str, target_bssid: str) -> ScanResult:
+        """Return only a selected radio; subclasses may optimize parsing further."""
+        target = normalize_bssid(target_bssid)
+        result = self.scan(selected_band)
+        result.networks = [network for network in result.networks if network.bssid == target]
+        return result
+
 
 class WindowsScanner(BaseScanner):
     description = "Windows WLAN (netsh)"
 
-    def scan(self, selected_band: str) -> ScanResult:
+    @staticmethod
+    def _run_netsh() -> tuple[Optional[subprocess.CompletedProcess[str]], str]:
         try:
             completed = subprocess.run(
                 ["netsh", "wlan", "show", "networks", "mode=bssid"],
@@ -122,39 +108,50 @@ class WindowsScanner(BaseScanner):
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return ScanResult([], error=f"Windows Wi-Fi scan failed: {exc}")
-
+            return None, f"Windows Wi-Fi scan failed: {exc}"
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
-            return ScanResult([], error=detail or "netsh returned an error.")
+            return None, detail or "netsh returned an error."
+        return completed, ""
 
+    @staticmethod
+    def _parse(output: str, selected_band: str, target_bssid: Optional[str] = None) -> list[Network]:
+        """Parse netsh once; target mode stops as soon as the selected BSSID is complete."""
+        target = normalize_bssid(target_bssid) if target_bssid else None
         networks: list[Network] = []
         current_ssid = "<hidden>"
         current_security = "Unknown"
         current: dict[str, object] = {}
 
-        def flush() -> None:
+        def flush() -> bool:
             nonlocal current
+            found_target = False
             if {"bssid", "signal", "channel"}.issubset(current):
+                bssid = str(current["bssid"])
                 channel = int(current["channel"])
-                if matches_band(channel, selected_band):
+                if (target is None or bssid == target) and matches_band(channel, selected_band):
+                    quality = float(current["signal"])
                     networks.append(
                         Network(
                             ssid=current_ssid,
-                            bssid=str(current["bssid"]),
+                            bssid=bssid,
                             channel=channel,
-                            rssi=signal_percent_to_dbm(float(current["signal"])),
+                            rssi=signal_percent_to_dbm(quality),
                             width=int(current.get("width", 20)),
                             security=current_security,
+                            signal_percent=quality,
                         )
                     )
+                    found_target = target is not None
             current = {}
+            return found_target
 
-        for raw_line in completed.stdout.replace("\r", "").splitlines():
+        for raw_line in output.replace("\r", "").splitlines():
             line = raw_line.strip()
             match = re.match(r"SSID\s+\d+\s*:\s*(.*)$", line, re.IGNORECASE)
             if match:
-                flush()
+                if flush():
+                    break
                 current_ssid = match.group(1).strip() or "<hidden>"
                 current_security = "Unknown"
                 continue
@@ -164,7 +161,8 @@ class WindowsScanner(BaseScanner):
                 continue
             match = re.match(r"BSSID\s+\d+\s*:\s*([0-9A-Fa-f:-]{17})", line, re.IGNORECASE)
             if match:
-                flush()
+                if flush():
+                    break
                 current["bssid"] = normalize_bssid(match.group(1))
                 continue
             match = re.match(r"Signal\s*:\s*(\d+)%", line, re.IGNORECASE)
@@ -178,17 +176,29 @@ class WindowsScanner(BaseScanner):
             match = re.match(r"Channel width\s*:\s*(\d+)", line, re.IGNORECASE)
             if match:
                 current["width"] = int(match.group(1))
-        flush()
+        else:
+            flush()
+        return deduplicate_networks(networks)
 
-        result = deduplicate_networks(networks)
-        return ScanResult(result, status=f"Found {len(result)} access point radios.")
+    def scan(self, selected_band: str) -> ScanResult:
+        completed, error = self._run_netsh()
+        if completed is None:
+            return ScanResult([], error=error)
+        networks = self._parse(completed.stdout, selected_band)
+        return ScanResult(networks, status=f"Found {len(networks)} access point radios.")
+
+    def scan_target(self, selected_band: str, target_bssid: str) -> ScanResult:
+        completed, error = self._run_netsh()
+        if completed is None:
+            return ScanResult([], error=error)
+        networks = self._parse(completed.stdout, selected_band, target_bssid)
+        return ScanResult(networks, status="Target sampled." if networks else "Target not seen.")
 
 
 class LinuxScanner(BaseScanner):
     def __init__(self, interface: Optional[str] = None):
         self.interface = interface or self._find_interface()
         self.description = f"Linux Wi-Fi ({self.interface or 'no interface'})"
-
     @staticmethod
     def _find_interface() -> Optional[str]:
         if shutil.which("iw"):
@@ -219,33 +229,35 @@ class LinuxScanner(BaseScanner):
             except (OSError, subprocess.TimeoutExpired):
                 pass
         return None
-
     def scan(self, selected_band: str) -> ScanResult:
+        return self._scan(selected_band)
+
+    def scan_target(self, selected_band: str, target_bssid: str) -> ScanResult:
+        return self._scan(selected_band, normalize_bssid(target_bssid))
+
+    def _scan(self, selected_band: str, target_bssid: Optional[str] = None) -> ScanResult:
         if not self.interface:
             return ScanResult([], error="No Linux Wi-Fi interface was detected.")
-
         iw_error = ""
         if shutil.which("iw"):
-            result = self._scan_iw(selected_band)
+            result = self._scan_iw(selected_band, target_bssid)
             if result.networks:
                 return result
             iw_error = result.error
-
         if shutil.which("nmcli"):
-            result = self._scan_nmcli(selected_band)
+            result = self._scan_nmcli(selected_band, target_bssid)
             if result.networks or not result.error:
                 return result
             if iw_error:
                 result.error = f"{iw_error} | nmcli: {result.error}"
             return result
-
         return ScanResult(
             [],
             error=iw_error
             or "Neither 'iw' nor 'nmcli' is available. Install iw or NetworkManager.",
         )
 
-    def _scan_iw(self, selected_band: str) -> ScanResult:
+    def _scan_iw(self, selected_band: str, target_bssid: Optional[str] = None) -> ScanResult:
         try:
             completed = subprocess.run(
                 ["iw", "dev", self.interface, "scan"],
@@ -256,12 +268,10 @@ class LinuxScanner(BaseScanner):
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return ScanResult([], error=f"iw scan failed: {exc}")
-
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             hint = " Grant scan permission/CAP_NET_ADMIN or run the app with appropriate privileges."
             return ScanResult([], error=(detail or "iw scan returned an error.") + hint)
-
         networks: list[Network] = []
         for cell in re.split(r"(?m)^BSS\s+", completed.stdout)[1:]:
             bssid_match = re.match(r"([0-9A-Fa-f:]{17})", cell)
@@ -269,6 +279,9 @@ class LinuxScanner(BaseScanner):
             freq_match = re.search(r"(?m)^\s*freq:\s*(\d+)", cell)
             signal_match = re.search(r"(?m)^\s*signal:\s*(-?\d+(?:\.\d+)?)\s*dBm", cell)
             if not (bssid_match and freq_match and signal_match):
+                continue
+            bssid = normalize_bssid(bssid_match.group(1))
+            if target_bssid and bssid != target_bssid:
                 continue
             channel = freq_to_channel(int(freq_match.group(1)))
             if channel is None or not matches_band(channel, selected_band):
@@ -282,7 +295,7 @@ class LinuxScanner(BaseScanner):
             networks.append(
                 Network(
                     ssid=(ssid_match.group(1).strip() if ssid_match else "") or "<hidden>",
-                    bssid=normalize_bssid(bssid_match.group(1)),
+                    bssid=bssid,
                     channel=channel,
                     rssi=float(signal_match.group(1)),
                     width=int(width_match.group(1)) if width_match else 20,
@@ -291,7 +304,6 @@ class LinuxScanner(BaseScanner):
             )
         result = deduplicate_networks(networks)
         return ScanResult(result, status=f"Found {len(result)} access point radios.")
-
     @staticmethod
     def _split_nmcli(line: str) -> list[str]:
         fields: list[str] = []
@@ -310,8 +322,7 @@ class LinuxScanner(BaseScanner):
                 current.append(char)
         fields.append("".join(current))
         return fields
-
-    def _scan_nmcli(self, selected_band: str) -> ScanResult:
+    def _scan_nmcli(self, selected_band: str, target_bssid: Optional[str] = None) -> ScanResult:
         try:
             completed = subprocess.run(
                 [
@@ -336,69 +347,42 @@ class LinuxScanner(BaseScanner):
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return ScanResult([], error=f"nmcli scan failed: {exc}")
-
         if completed.returncode != 0:
             return ScanResult([], error=completed.stderr.strip() or "nmcli returned an error.")
-
         networks: list[Network] = []
         for line in completed.stdout.splitlines():
             fields = self._split_nmcli(line)
             if len(fields) != 6:
                 continue
-            ssid, bssid, channel_text, signal_text, freq_text, security = fields
+            ssid, bssid_text, channel_text, signal_text, freq_text, security = fields
             try:
+                bssid = normalize_bssid(bssid_text)
+                if target_bssid and bssid != target_bssid:
+                    continue
                 channel = int(channel_text) if channel_text else freq_to_channel(int(freq_text))
                 if channel is None or not matches_band(channel, selected_band):
                     continue
                 networks.append(
                     Network(
                         ssid=ssid or "<hidden>",
-                        bssid=normalize_bssid(bssid),
+                        bssid=bssid,
                         channel=channel,
                         rssi=signal_percent_to_dbm(float(signal_text)),
                         width=20,
                         security=security or "Open",
+                        signal_percent=float(signal_text),
                     )
                 )
             except ValueError:
                 continue
         result = deduplicate_networks(networks)
         return ScanResult(result, status=f"Found {len(result)} access point radios.")
-
-
 class UnsupportedScanner(BaseScanner):
     def __init__(self, system_name: str):
         self.description = f"Unsupported platform ({system_name})"
-
     def scan(self, selected_band: str) -> ScanResult:
         return ScanResult([], error=f"Wi-Fi scanning is not implemented for {platform.system()}.")
-
-
-class DemoScanner(BaseScanner):
-    """Hardware-free scanner for UI testing: run with --demo."""
-
-    description = "Demo data (no Wi-Fi hardware used)"
-
-    def __init__(self):
-        self.started = time.monotonic()
-
-    def scan(self, selected_band: str) -> ScanResult:
-        phase = time.monotonic() - self.started
-        strength = -66 + 18 * math.sin(phase / 7.0) + random.uniform(-2.5, 2.5)
-        all_networks = [
-            Network("Office-WiFi", "02:11:22:33:44:50", 1, -72 + random.uniform(-2, 2), 20, "WPA2"),
-            Network("Office-WiFi", "02:11:22:33:44:51", 6, strength, 20, "WPA2"),
-            Network("Guest", "02:AA:BB:CC:DD:01", 11, -82 + random.uniform(-2, 2), 20, "WPA2"),
-            Network("Lab-5G", "02:AA:BB:CC:DD:02", 44, -58 + random.uniform(-3, 3), 40, "WPA3"),
-            Network("Printer", "02:AA:BB:CC:DD:03", 149, -77 + random.uniform(-3, 3), 20, "WPA2"),
-        ]
-        networks = [n for n in all_networks if matches_band(n.channel, selected_band)]
-        return ScanResult(networks, status=f"Demo scan: {len(networks)} access point radios.")
-
-
-def make_scanner(demo: bool = False, interface: Optional[str] = None) -> BaseScanner:
-    if demo:
-        return DemoScanner()
+def make_scanner(interface: Optional[str] = None) -> BaseScanner:
     system = platform.system()
     if system == "Windows":
         return WindowsScanner()
@@ -408,49 +392,50 @@ def make_scanner(demo: bool = False, interface: Optional[str] = None) -> BaseSca
 
 
 class SignalTracker:
-    def __init__(self, history_size: int = 12, alpha: float = 0.25):
+    def __init__(self, history_size: int = 12, alpha: float = 0.35):
         self.history_size = history_size
         self.alpha = alpha
         self.target_bssid: Optional[str] = None
         self.reset()
-
     def reset(self) -> None:
         self.samples: deque[float] = deque(maxlen=self.history_size)
         self.current: Optional[float] = None
         self.smoothed: Optional[float] = None
+        self.proximity: Optional[float] = None
         self.peak: Optional[float] = None
         self.sample_count = 0
         self.started_at = time.monotonic()
         self.misses = 0
-
     def set_target(self, bssid: str) -> None:
         self.target_bssid = normalize_bssid(bssid)
         self.reset()
-
-    def add(self, rssi: float) -> float:
+    def add(self, rssi: float, signal_percent: Optional[float] = None) -> float:
         value = float(rssi)
+        raw_score = (
+            max(0.0, min(100.0, float(signal_percent)))
+            if signal_percent is not None
+            else (max(-90.0, min(-30.0, value)) + 90.0) / 60.0 * 100.0
+        )
         self.current = value
         self.smoothed = value if self.smoothed is None else self.alpha * value + (1 - self.alpha) * self.smoothed
+        self.proximity = (
+            raw_score
+            if self.proximity is None
+            else self.alpha * raw_score + (1 - self.alpha) * self.proximity
+        )
         self.peak = value if self.peak is None else max(self.peak, value)
         self.samples.append(value)
         self.sample_count += 1
         self.misses = 0
         return self.score
-
     def miss(self) -> None:
         self.misses += 1
-
     @property
     def score(self) -> float:
-        if self.smoothed is None:
-            return 0.0
-        clamped = max(-90.0, min(-30.0, self.smoothed))
-        return (clamped + 90.0) / 60.0 * 100.0
-
+        return self.proximity if self.proximity is not None else 0.0
     @property
     def average(self) -> Optional[float]:
         return sum(self.samples) / len(self.samples) if self.samples else None
-
     @property
     def trend(self) -> str:
         if len(self.samples) < 6:
@@ -465,27 +450,39 @@ class SignalTracker:
         if delta < -2.0:
             return "↓ Getting colder"
         return "→ Steady"
-
     @property
     def elapsed(self) -> str:
         seconds = max(0, int(time.monotonic() - self.started_at))
         return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
-
 class WifiAnalyzerApp:
-    TRACK_INTERVAL_MS = 1200
+    # RF sampling is intentionally independent from the expensive analyzer redraw.
+    HUNTER_INTERVAL_MS = 800
+    GAUGE_FRAME_MS = 50
 
     def __init__(self, root: tk.Tk, scanner: BaseScanner):
         self.root = root
         self.scanner = scanner
-        self.result_queue: queue.Queue[ScanResult] = queue.Queue()
+        self.result_queue: queue.Queue[tuple[str, Optional[str], ScanResult]] = queue.Queue()
         self.scan_running = False
-        self.after_id: Optional[str] = None
-        self.tracking = False
+        self.active_scan_kind: Optional[str] = None
+        self.pending_analyzer_scan = False
+        self.analyzer_after_id: Optional[str] = None
+        self.hunter_after_id: Optional[str] = None
+        self.poll_after_id: Optional[str] = None
         self.beep_after_id: Optional[str] = None
+        self.gauge_after_id: Optional[str] = None
+        self.gauge_resize_after_id: Optional[str] = None
+        self.closing = False
+        self.tracking = False
         self.networks: list[Network] = []
         self.network_by_bssid: dict[str, Network] = {}
         self.tracker = SignalTracker()
+
+        self.gauge_target = 0.0
+        self.gauge_display = 0.0
+        self.gauge_caption = "Select an SSID and BSSID"
+        self.gauge_items: dict[str, int] = {}
+        self.gauge_geometry = (0.0, 0.0, 0.0)
 
         self.band_var = tk.StringVar(value="2.4")
         self.refresh_var = tk.StringVar(value="5")
@@ -500,19 +497,17 @@ class WifiAnalyzerApp:
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.after(100, self._poll_queue)
-        self.root.after(250, lambda: self.start_scan(force=True))
-        self._draw_gauge(0, "Select an SSID and BSSID")
+        self.poll_after_id = self.root.after(100, self._poll_queue)
+        self.root.after(250, lambda: self.start_analyzer_scan(force=True))
+        self._set_gauge_target(0, self.gauge_caption, immediate=True)
 
     def _build_ui(self) -> None:
         self.root.title("Wi-Fi Analyzer + AP Hunter")
         self.root.geometry("1120x760")
         self.root.minsize(900, 650)
-
         style = ttk.Style(self.root)
         if "clam" in style.theme_names():
             style.theme_use("clam")
-
         controls = ttk.Frame(self.root, padding=(10, 8))
         controls.pack(fill=tk.X)
         ttk.Label(controls, text="Wi-Fi band:").pack(side=tk.LEFT)
@@ -530,36 +525,30 @@ class WifiAnalyzerApp:
             controls, textvariable=self.refresh_var, values=("2", "5", "10", "20"), width=4, state="readonly"
         )
         refresh_box.pack(side=tk.LEFT, padx=5)
-        refresh_box.bind("<<ComboboxSelected>>", lambda _event: self._schedule_next_scan())
-        self.scan_button = ttk.Button(controls, text="Scan now", command=lambda: self.start_scan(force=True))
+        refresh_box.bind("<<ComboboxSelected>>", lambda _event: self._schedule_analyzer_scan())
+        self.scan_button = ttk.Button(controls, text="Scan now", command=lambda: self.start_analyzer_scan(force=True))
         self.scan_button.pack(side=tk.LEFT, padx=8)
         ttk.Label(controls, textvariable=self.status_var).pack(side=tk.LEFT, padx=12)
-
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self.analyzer_tab = ttk.Frame(self.notebook)
         self.hunter_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.analyzer_tab, text="Channel Analyzer")
         self.notebook.add(self.hunter_tab, text="AP Hunter")
-
         self._build_analyzer_tab()
         self._build_hunter_tab()
-
     def _build_analyzer_tab(self) -> None:
         pane = ttk.Panedwindow(self.analyzer_tab, orient=tk.VERTICAL)
         pane.pack(fill=tk.BOTH, expand=True)
-
         plot_frame = ttk.Frame(pane)
         table_frame = ttk.Frame(pane, padding=(0, 6, 0, 0))
         pane.add(plot_frame, weight=4)
         pane.add(table_frame, weight=1)
-
         self.figure = Figure(figsize=(10, 5), dpi=100, facecolor="black")
         self.axis = self.figure.add_subplot(111)
         self.figure.subplots_adjust(left=0.07, right=0.98, bottom=0.12, top=0.9)
         self.plot_canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.plot_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
         columns = ("ssid", "bssid", "channel", "rssi", "security")
         self.network_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=6)
         headings = {"ssid": "SSID", "bssid": "BSSID", "channel": "Channel", "rssi": "RSSI", "security": "Security"}
@@ -572,11 +561,9 @@ class WifiAnalyzerApp:
         self.network_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.network_tree.bind("<Double-1>", self._track_tree_selection)
-
     def _build_hunter_tab(self) -> None:
         outer = ttk.Frame(self.hunter_tab, padding=12)
         outer.pack(fill=tk.BOTH, expand=True)
-
         select_frame = ttk.LabelFrame(outer, text="Target access point", padding=10)
         select_frame.pack(fill=tk.X)
         ttk.Label(select_frame, text="SSID:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
@@ -588,17 +575,15 @@ class WifiAnalyzerApp:
         self.bssid_combo.grid(row=0, column=3, sticky=tk.EW)
         select_frame.columnconfigure(1, weight=1)
         select_frame.columnconfigure(3, weight=1)
-
         content = ttk.Frame(outer)
         content.pack(fill=tk.BOTH, expand=True, pady=10)
         left = ttk.Frame(content)
         right = ttk.LabelFrame(content, text="Live measurements", padding=12)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
-
         self.gauge = tk.Canvas(left, bg="#111111", highlightthickness=0, height=410)
         self.gauge.pack(fill=tk.BOTH, expand=True)
-
+        self.gauge.bind("<Configure>", self._gauge_resized)
         metric_labels = (
             ("Current RSSI", "current"),
             ("Smoothed RSSI", "smoothed"),
@@ -615,7 +600,6 @@ class WifiAnalyzerApp:
             ttk.Label(right, textvariable=self.metric_vars[key], font=("TkDefaultFont", 10, "bold")).grid(
                 row=row, column=1, sticky=tk.W, pady=5
             )
-
         buttons = ttk.Frame(outer)
         buttons.pack(fill=tk.X)
         self.start_button = ttk.Button(buttons, text="Start tracking", command=self.start_tracking)
@@ -631,65 +615,131 @@ class WifiAnalyzerApp:
             text="RSSI indicates relative proximity only; reflections, walls and antenna orientation affect it.",
             foreground="#555555",
         ).pack(side=tk.RIGHT)
-
-    def start_scan(self, force: bool = False) -> None:
-        if self.scan_running:
-            if force:
-                self.status_var.set("A scan is already running…")
+    def start_analyzer_scan(self, force: bool = False) -> None:
+        if self.closing:
             return
-        if self.after_id is not None:
-            self.root.after_cancel(self.after_id)
-            self.after_id = None
-        self.scan_running = True
+        if self.analyzer_after_id is not None:
+            self.root.after_cancel(self.analyzer_after_id)
+            self.analyzer_after_id = None
+        if self.scan_running:
+            self.pending_analyzer_scan = True
+            if force:
+                self.status_var.set("A scan is already running; analyzer refresh queued…")
+            return
+        self.pending_analyzer_scan = False
+        self._start_scan_worker("analyzer", self.band_var.get())
         self.scan_button.configure(state=tk.DISABLED)
-        self.status_var.set("Scanning…")
-        band = self.band_var.get()
-        threading.Thread(target=self._scan_worker, args=(band,), daemon=True).start()
+        self.status_var.set("Scanning all access points…")
 
-    def _scan_worker(self, band: str) -> None:
+    def start_hunter_scan(self) -> None:
+        if self.closing or not self.tracking or not self.tracker.target_bssid:
+            return
+        if self.hunter_after_id is not None:
+            self.root.after_cancel(self.hunter_after_id)
+            self.hunter_after_id = None
+        if self.scan_running:
+            self.hunter_after_id = self.root.after(150, self.start_hunter_scan)
+            return
+        self._start_scan_worker("hunter", self.band_var.get(), self.tracker.target_bssid)
+
+    def _start_scan_worker(self, kind: str, band: str, target_bssid: Optional[str] = None) -> None:
+        self.scan_running = True
+        self.active_scan_kind = kind
+        threading.Thread(
+            target=self._scan_worker,
+            args=(kind, band, target_bssid),
+            daemon=True,
+        ).start()
+
+    def _scan_worker(self, kind: str, band: str, target_bssid: Optional[str]) -> None:
         try:
-            result = self.scanner.scan(band)
+            result = (
+                self.scanner.scan_target(band, target_bssid)
+                if kind == "hunter" and target_bssid
+                else self.scanner.scan(band)
+            )
         except Exception as exc:  # Keep worker failures away from Tk's main loop.
             result = ScanResult([], error=f"Unexpected scanner error: {exc}")
-        self.result_queue.put(result)
+        self.result_queue.put((kind, target_bssid, result))
 
     def _poll_queue(self) -> None:
+        if self.closing:
+            return
         try:
             while True:
-                result = self.result_queue.get_nowait()
-                self._handle_scan_result(result)
+                kind, requested_target, result = self.result_queue.get_nowait()
+                self._handle_scan_result(kind, requested_target, result)
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_queue)
+        self.poll_after_id = self.root.after(50, self._poll_queue)
 
-    def _handle_scan_result(self, result: ScanResult) -> None:
+    def _handle_scan_result(
+        self,
+        kind: str,
+        requested_target: Optional[str],
+        result: ScanResult,
+    ) -> None:
         self.scan_running = False
+        self.active_scan_kind = None
         self.scan_button.configure(state=tk.NORMAL)
-        if result.error:
-            self.status_var.set(result.error)
+
+        if kind == "analyzer":
+            if result.error:
+                self.status_var.set(result.error)
+            else:
+                self.status_var.set(result.status or f"Found {len(result.networks)} access point radios.")
+            # Do not discard the last usable list on a transient scan error.
+            if result.networks or not result.error:
+                self.networks = result.networks
+                self.network_by_bssid = {network.bssid: network for network in self.networks}
+                self._draw_plot()
+                self._refresh_network_table()
+                self._refresh_target_controls()
+            if self.tracking:
+                self._update_tracker_from_scan(result.networks)
+            self._schedule_analyzer_scan()
         else:
-            self.status_var.set(result.status or f"Found {len(result.networks)} access point radios.")
+            # A target can change while an OS scan is still completing. Ignore
+            # stale results instead of counting them as a miss for the new AP.
+            target_is_current = (
+                self.tracking
+                and requested_target is not None
+                and normalize_bssid(requested_target) == self.tracker.target_bssid
+            )
+            if target_is_current:
+                self._update_tracker_from_scan(result.networks)
+                if result.error and self.tracker.misses >= 2:
+                    self.status_var.set(f"AP Hunter scan error: {result.error}")
+                elif self.tracker.target_bssid:
+                    self.status_var.set(
+                        f"Tracking {self.tracker.target_bssid} — {self.tracker.sample_count} samples"
+                    )
+            self._schedule_hunter_scan()
 
-        # Do not discard the last usable list on a transient scan error.
-        if result.networks or not result.error:
-            self.networks = result.networks
-            self.network_by_bssid = {network.bssid: network for network in self.networks}
-            self._draw_plot()
-            self._refresh_network_table()
-            self._refresh_target_controls()
-        self._update_tracker_from_scan(result.networks)
-        self._schedule_next_scan()
+        if self.pending_analyzer_scan:
+            self.pending_analyzer_scan = False
+            self.root.after_idle(lambda: self.start_analyzer_scan(force=True))
 
-    def _schedule_next_scan(self) -> None:
-        if self.after_id is not None:
-            self.root.after_cancel(self.after_id)
-        delay = self.TRACK_INTERVAL_MS if self.tracking else int(self.refresh_var.get()) * 1000
-        self.after_id = self.root.after(delay, self.start_scan)
+    def _schedule_analyzer_scan(self) -> None:
+        if self.closing:
+            return
+        if self.analyzer_after_id is not None:
+            self.root.after_cancel(self.analyzer_after_id)
+        delay = max(2, int(self.refresh_var.get())) * 1000
+        self.analyzer_after_id = self.root.after(delay, self.start_analyzer_scan)
+
+    def _schedule_hunter_scan(self, immediate: bool = False) -> None:
+        if self.closing or not self.tracking:
+            return
+        if self.hunter_after_id is not None:
+            self.root.after_cancel(self.hunter_after_id)
+        delay = 0 if immediate else self.HUNTER_INTERVAL_MS
+        self.hunter_after_id = self.root.after(delay, self.start_hunter_scan)
 
     def _band_changed(self) -> None:
         if self.tracking:
             self.stop_tracking()
-        self.start_scan(force=True)
+        self.start_analyzer_scan(force=True)
 
     def _draw_plot(self) -> None:
         axis = self.axis
@@ -698,13 +748,12 @@ class WifiAnalyzerApp:
         band = self.band_var.get()
         axis.set_title(f"Wi-Fi Channel Overlap ({band} GHz)", fontsize=11, color="white")
         x_min, x_max, points = ((0.5, 14.5, 400) if band == "2.4" else (30, 177, 800))
-
+        x_values = np.linspace(x_min, x_max, points)
         for network in self.networks:
             if not matches_band(network.channel, band):
                 continue
             strength = max(-100.0, min(-30.0, network.rssi))
             sigma = max(0.5, (network.width / 20.0) * 1.2)
-            x_values = np.linspace(x_min, x_max, points)
             normalized = np.exp(-0.5 * ((x_values - network.channel) / sigma) ** 2)
             y_values = strength - (1 - normalized) * 30
             color = stable_color(network.bssid)
@@ -719,7 +768,6 @@ class WifiAnalyzerApp:
                 fontsize=7,
                 bbox=dict(facecolor=color, alpha=0.25, edgecolor="none"),
             )
-
         if band == "2.4":
             axis.set_xlim(0.5, 14.5)
             axis.set_xticks(range(1, 15))
@@ -736,17 +784,20 @@ class WifiAnalyzerApp:
         for spine in axis.spines.values():
             spine.set_color("#777777")
         self.plot_canvas.draw_idle()
-
     def _refresh_network_table(self) -> None:
-        for item in self.network_tree.get_children():
-            self.network_tree.delete(item)
-        for network in sorted(self.networks, key=lambda n: n.rssi, reverse=True):
-            self.network_tree.insert(
-                "",
-                tk.END,
-                iid=network.bssid,
-                values=(network.ssid, network.bssid, network.channel, f"{network.rssi:.1f} dBm", network.security),
-            )
+        """Update changed rows in place instead of rebuilding the Treeview."""
+        desired = {network.bssid: network for network in self.networks}
+        existing = set(self.network_tree.get_children())
+        for stale in existing - desired.keys():
+            self.network_tree.delete(stale)
+        for position, network in enumerate(sorted(self.networks, key=lambda n: n.rssi, reverse=True)):
+            values = (network.ssid, network.bssid, network.channel, f"{network.rssi:.1f} dBm", network.security)
+            if network.bssid in existing:
+                if tuple(self.network_tree.item(network.bssid, "values")) != tuple(str(value) for value in values):
+                    self.network_tree.item(network.bssid, values=values)
+                self.network_tree.move(network.bssid, "", position)
+            else:
+                self.network_tree.insert("", position, iid=network.bssid, values=values)
 
     def _refresh_target_controls(self) -> None:
         # Keep the locked target visible while hunting, even if one scan misses it.
@@ -764,12 +815,10 @@ class WifiAnalyzerApp:
         else:
             self.ssid_var.set("")
         self._set_bssid_choices()
-
     def _ssid_selected(self, _event=None) -> None:
         if self.tracking:
             self.stop_tracking()
         self._set_bssid_choices()
-
     def _set_bssid_choices(self, preferred_bssid: Optional[str] = None) -> None:
         selected_ssid = self.ssid_var.get()
         matches = [network for network in self.networks if network.ssid == selected_ssid]
@@ -780,11 +829,9 @@ class WifiAnalyzerApp:
         if not chosen and labels:
             chosen = labels[0]
         self.bssid_var.set(chosen)
-
     def _selected_bssid(self) -> Optional[str]:
         match = re.match(r"([0-9A-Fa-f:]{17})", self.bssid_var.get())
         return normalize_bssid(match.group(1)) if match else None
-
     def _track_tree_selection(self, _event=None) -> None:
         selection = self.network_tree.selection()
         if not selection:
@@ -795,7 +842,6 @@ class WifiAnalyzerApp:
         self.ssid_var.set(network.ssid)
         self._set_bssid_choices(network.bssid)
         self.notebook.select(self.hunter_tab)
-
     def start_tracking(self) -> None:
         bssid = self._selected_bssid()
         if not bssid or bssid not in self.network_by_bssid:
@@ -811,29 +857,29 @@ class WifiAnalyzerApp:
         self.ssid_combo.configure(state=tk.DISABLED)
         self.bssid_combo.configure(state=tk.DISABLED)
         self.status_var.set(f"Tracking {target.ssid} ({bssid})…")
-        self._update_tracker_from_scan(self.networks)
-        self._schedule_next_scan()
+        self._update_metric_labels(target)
+        self._set_gauge_target(0, "Waiting for a fresh target sample…", immediate=True)
+        self._schedule_hunter_scan(immediate=True)
         self._schedule_beep()
-
     def stop_tracking(self) -> None:
         self.tracking = False
         self.start_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
         self.ssid_combo.configure(state="readonly")
         self.bssid_combo.configure(state="readonly")
+        if self.hunter_after_id is not None:
+            self.root.after_cancel(self.hunter_after_id)
+            self.hunter_after_id = None
         if self.beep_after_id is not None:
             self.root.after_cancel(self.beep_after_id)
             self.beep_after_id = None
         self.status_var.set("Tracking stopped.")
-        self._schedule_next_scan()
-
     def reset_tracker(self) -> None:
         target = self.tracker.target_bssid
         self.tracker.reset()
         self.tracker.target_bssid = target
         self._update_metric_labels(None)
-        self._draw_gauge(0, "Waiting for a target sample…" if target else "Select an SSID and BSSID")
-
+        self._set_gauge_target(0, "Waiting for a target sample…" if target else "Select an SSID and BSSID", immediate=True)
     def _update_tracker_from_scan(self, networks: list[Network]) -> None:
         if not self.tracking or not self.tracker.target_bssid:
             return
@@ -843,16 +889,16 @@ class WifiAnalyzerApp:
             self.metric_vars["elapsed"].set(self.tracker.elapsed)
             self.metric_vars["trend"].set("Target not seen")
             if self.tracker.misses >= 3:
-                self._draw_gauge(0, "Target not seen in recent scans")
+                self._set_gauge_target(0, "Target not seen in recent scans")
             return
-        score = self.tracker.add(target.rssi)
+        score = self.tracker.add(target.rssi, target.signal_percent)
         self._update_metric_labels(target)
-        self._draw_gauge(score, self.tracker.trend)
-
+        self._set_gauge_target(score, self.tracker.trend)
+        if self.audio_var.get() and self.beep_after_id is None:
+            self._schedule_beep()
     @staticmethod
     def _format_dbm(value: Optional[float]) -> str:
         return "—" if value is None else f"{value:.1f} dBm"
-
     def _update_metric_labels(self, target: Optional[Network]) -> None:
         self.metric_vars["current"].set(self._format_dbm(self.tracker.current))
         self.metric_vars["smoothed"].set(self._format_dbm(self.tracker.smoothed))
@@ -863,45 +909,91 @@ class WifiAnalyzerApp:
         self.metric_vars["elapsed"].set(self.tracker.elapsed)
         self.metric_vars["channel"].set(f"{target.channel} / {target.band} GHz" if target else "—")
         self.metric_vars["security"].set(target.security if target else "—")
+    def _set_gauge_target(self, score: float, caption: str, immediate: bool = False) -> None:
+        self.gauge_target = max(0.0, min(100.0, float(score)))
+        self.gauge_caption = caption
+        if not self.gauge_items:
+            self._rebuild_gauge()
+        elif "caption" in self.gauge_items:
+            self.gauge.itemconfigure(self.gauge_items["caption"], text=caption)
+        if immediate:
+            self.gauge_display = self.gauge_target
+            self._update_gauge_dynamic()
+        if self.gauge_after_id is None and not immediate:
+            self.gauge_after_id = self.root.after(self.GAUGE_FRAME_MS, self._animate_gauge)
 
-    def _draw_gauge(self, score: float, caption: str) -> None:
+    def _gauge_resized(self, _event=None) -> None:
+        if self.gauge_resize_after_id is not None:
+            self.root.after_cancel(self.gauge_resize_after_id)
+        self.gauge_resize_after_id = self.root.after(75, self._rebuild_gauge)
+
+    def _rebuild_gauge(self) -> None:
+        self.gauge_resize_after_id = None
         canvas = self.gauge
         canvas.delete("all")
-        width = max(canvas.winfo_width(), 640)
-        height = max(canvas.winfo_height(), 390)
+        width = max(canvas.winfo_width(), 320)
+        height = max(canvas.winfo_height(), 300)
         center_x, center_y = width / 2, height * 0.67
-        radius = min(width * 0.34, height * 0.5)
+        radius = max(100.0, min(width * 0.34, height * 0.48))
+        self.gauge_geometry = (center_x, center_y, radius)
         box = (center_x - radius, center_y - radius, center_x + radius, center_y + radius)
-        arc_width = 28
+        arc_width = max(14, min(28, int(radius / 7)))
         canvas.create_arc(*box, start=180, extent=-60, style=tk.ARC, width=arc_width, outline="#D9534F")
         canvas.create_arc(*box, start=120, extent=-60, style=tk.ARC, width=arc_width, outline="#F0AD4E")
         canvas.create_arc(*box, start=60, extent=-60, style=tk.ARC, width=arc_width, outline="#5CB85C")
-
         for tick in range(0, 101, 10):
             angle = math.radians(180 - tick * 1.8)
             inner = radius - 25
             outer = radius + 2
-            x1 = center_x + inner * math.cos(angle)
-            y1 = center_y - inner * math.sin(angle)
-            x2 = center_x + outer * math.cos(angle)
-            y2 = center_y - outer * math.sin(angle)
-            canvas.create_line(x1, y1, x2, y2, fill="#DDDDDD", width=2)
-            label_radius = radius + 38
-            lx = center_x + label_radius * math.cos(angle)
-            ly = center_y - label_radius * math.sin(angle)
-            canvas.create_text(lx, ly, text=str(tick), fill="#CCCCCC", font=("TkDefaultFont", 9))
+            canvas.create_line(
+                center_x + inner * math.cos(angle),
+                center_y - inner * math.sin(angle),
+                center_x + outer * math.cos(angle),
+                center_y - outer * math.sin(angle),
+                fill="#DDDDDD",
+                width=2,
+            )
+            label_radius = radius + 34
+            canvas.create_text(
+                center_x + label_radius * math.cos(angle),
+                center_y - label_radius * math.sin(angle),
+                text=str(tick),
+                fill="#CCCCCC",
+                font=("TkDefaultFont", 9),
+            )
+        self.gauge_items = {
+            "needle": canvas.create_line(center_x, center_y, center_x - radius + 38, center_y, fill="#D9534F", width=6, arrow=tk.LAST),
+            "hub": canvas.create_oval(center_x - 11, center_y - 11, center_x + 11, center_y + 11, fill="#EEEEEE", outline=""),
+            "value": canvas.create_text(center_x, center_y + 55, text="0%", fill="white", font=("TkDefaultFont", 30, "bold")),
+            "caption": canvas.create_text(center_x, center_y + 91, text=self.gauge_caption, fill="#DDDDDD", font=("TkDefaultFont", 13, "bold")),
+        }
+        canvas.create_text(center_x, 28, text="AP PROXIMITY", fill="#AAAAAA", font=("TkDefaultFont", 11, "bold"))
+        self._update_gauge_dynamic()
 
-        clamped = max(0.0, min(100.0, score))
+    def _animate_gauge(self) -> None:
+        self.gauge_after_id = None
+        difference = self.gauge_target - self.gauge_display
+        if abs(difference) < 0.1:
+            self.gauge_display = self.gauge_target
+        else:
+            self.gauge_display += difference * 0.18
+        self._update_gauge_dynamic()
+        if abs(self.gauge_target - self.gauge_display) >= 0.1 and not self.closing:
+            self.gauge_after_id = self.root.after(self.GAUGE_FRAME_MS, self._animate_gauge)
+
+    def _update_gauge_dynamic(self) -> None:
+        if not self.gauge_items:
+            return
+        center_x, center_y, radius = self.gauge_geometry
+        clamped = max(0.0, min(100.0, self.gauge_display))
         angle = math.radians(180 - clamped * 1.8)
         needle_length = radius - 38
         needle_x = center_x + needle_length * math.cos(angle)
         needle_y = center_y - needle_length * math.sin(angle)
         needle_color = "#5CB85C" if clamped >= 67 else "#F0AD4E" if clamped >= 34 else "#D9534F"
-        canvas.create_line(center_x, center_y, needle_x, needle_y, fill=needle_color, width=6, arrow=tk.LAST)
-        canvas.create_oval(center_x - 11, center_y - 11, center_x + 11, center_y + 11, fill="#EEEEEE", outline="")
-        canvas.create_text(center_x, center_y + 55, text=f"{clamped:.0f}%", fill="white", font=("TkDefaultFont", 30, "bold"))
-        canvas.create_text(center_x, center_y + 91, text=caption, fill="#DDDDDD", font=("TkDefaultFont", 13, "bold"))
-        canvas.create_text(center_x, 28, text="AP PROXIMITY", fill="#AAAAAA", font=("TkDefaultFont", 11, "bold"))
+        self.gauge.coords(self.gauge_items["needle"], center_x, center_y, needle_x, needle_y)
+        self.gauge.itemconfigure(self.gauge_items["needle"], fill=needle_color)
+        self.gauge.itemconfigure(self.gauge_items["value"], text=f"{clamped:.0f}%")
 
     def _audio_changed(self) -> None:
         if self.audio_var.get() and self.tracking:
@@ -909,7 +1001,6 @@ class WifiAnalyzerApp:
         elif self.beep_after_id is not None:
             self.root.after_cancel(self.beep_after_id)
             self.beep_after_id = None
-
     def _schedule_beep(self) -> None:
         if self.beep_after_id is not None:
             self.root.after_cancel(self.beep_after_id)
@@ -919,37 +1010,39 @@ class WifiAnalyzerApp:
         try:
             if platform.system() == "Windows":
                 import winsound
-
-                winsound.MessageBeep(winsound.MB_OK)
+                winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
             else:
                 self.root.bell()
         except (ImportError, RuntimeError, tk.TclError):
             pass
         delay = int(max(140, 1300 - self.tracker.score * 11.0))
         self.beep_after_id = self.root.after(delay, self._schedule_beep)
-
     def close(self) -> None:
-        if self.after_id is not None:
-            self.root.after_cancel(self.after_id)
-        if self.beep_after_id is not None:
-            self.root.after_cancel(self.beep_after_id)
+        self.closing = True
+        for after_id in (
+            self.analyzer_after_id,
+            self.hunter_after_id,
+            self.poll_after_id,
+            self.beep_after_id,
+            self.gauge_after_id,
+            self.gauge_resize_after_id,
+        ):
+            if after_id is not None:
+                try:
+                    self.root.after_cancel(after_id)
+                except tk.TclError:
+                    pass
         self.root.destroy()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Wi-Fi channel analyzer and RSSI AP Hunter")
-    parser.add_argument("--demo", action="store_true", help="show simulated networks without using Wi-Fi hardware")
     parser.add_argument("--interface", help="Linux Wi-Fi interface to scan (for example wlan1)")
     return parser.parse_args()
-
-
 def main() -> None:
     args = parse_args()
     root = tk.Tk()
-    WifiAnalyzerApp(root, make_scanner(demo=args.demo, interface=args.interface))
+    WifiAnalyzerApp(root, make_scanner(interface=args.interface))
     root.mainloop()
-
-
 if __name__ == "__main__":
     main()
-
