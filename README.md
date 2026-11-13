@@ -27,12 +27,6 @@ To select a specific Linux adapter:
 python wifi_analyzer_ap_hunter.py --interface wlan1
 ```
 
-To test the complete interface without Wi-Fi hardware:
-
-```bash
-python wifi_analyzer_ap_hunter.py --demo
-```
-
 ## Use AP Hunter
 
 1. Scan the applicable band.
