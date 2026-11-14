@@ -755,7 +755,7 @@ class WifiAnalyzerApp:
             strength = max(-100.0, min(-30.0, network.rssi))
             sigma = max(0.5, (network.width / 20.0) * 1.2)
             normalized = np.exp(-0.5 * ((x_values - network.channel) / sigma) ** 2)
-            y_values = strength - (1 - normalized) * 30
+            y_values = -100 + normalized * (strength + 100)
             color = stable_color(network.bssid)
             axis.fill_between(x_values, y_values, -100, color=color, alpha=0.5)
             axis.text(
@@ -773,7 +773,7 @@ class WifiAnalyzerApp:
             axis.set_xticks(range(1, 15))
         else:
             axis.set_xlim(30, 177)
-            common_channels = [36, 40, 44, 48, 52, 56, 60, 64, 100, 116, 132, 149, 157, 165]
+            common_channels = (range(30, 166, 10))
             axis.set_xticks(common_channels)
         axis.set_ylim(-100, -25)
         axis.set_yticks(range(-100, -20, 10))
