@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wifi-analyzer-hunter"
+version = "3.11152026.130"
+description = "Cross-platform Wi-Fi channel analyzer and access-point hunter"
+requires-python = ">=3.9"
+dependencies = [
+  "matplotlib>=3.6",
+  "numpy>=1.23",
+]
+
+[project.scripts]
+wifi-analyzer = "wifi_analyzer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wifi_analyzer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
