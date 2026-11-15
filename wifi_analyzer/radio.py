@@ -8,7 +8,7 @@ from typing import Iterable, Optional
 from .models import Network
 
 def freq_to_channel(freq_mhz: int) -> Optional[int]:
-    """Convert common 2.4/5/6 GHz center frequencies to channel numbers."""
+    """Convert common 2.4/5 GHz center frequencies to channel numbers."""
     freq = int(freq_mhz)
     if 2412 <= freq <= 2472:
         return (freq - 2407) // 5
