@@ -112,20 +112,42 @@ class WifiAnalyzerApp:
         pane.add(table_frame, weight=1)
         self.figure = Figure(figsize=(10, 5), dpi=100, facecolor="black")
         self.axis = self.figure.add_subplot(111)
-        self.figure.subplots_adjust(left=0.07, right=0.98, bottom=0.12, top=0.9)
+        # Leave room on the right for the dBm ticks/label, matching the
+        # reference analyzer layout.
+        self.figure.subplots_adjust(left=0.07, right=0.92, bottom=0.12, top=0.9)
         self.plot_canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.plot_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        table_toolbar = ttk.Frame(table_frame)
+        table_toolbar.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(
+            table_toolbar,
+            text="Select one or more access-point radios to highlight them (Ctrl+click for multiple).",
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            table_toolbar,
+            text="Clear highlight",
+            command=self._clear_analyzer_selection,
+        ).pack(side=tk.RIGHT)
+        table_body = ttk.Frame(table_frame)
+        table_body.pack(fill=tk.BOTH, expand=True)
         columns = ("ssid", "bssid", "channel", "rssi", "security")
-        self.network_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=6)
+        self.network_tree = ttk.Treeview(
+            table_body,
+            columns=columns,
+            show="headings",
+            height=6,
+            selectmode="extended",
+        )
         headings = {"ssid": "SSID", "bssid": "BSSID", "channel": "Channel", "rssi": "RSSI", "security": "Security"}
         widths = {"ssid": 230, "bssid": 180, "channel": 80, "rssi": 90, "security": 150}
         for column in columns:
             self.network_tree.heading(column, text=headings[column])
             self.network_tree.column(column, width=widths[column], anchor=tk.CENTER if column in ("channel", "rssi") else tk.W)
-        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.network_tree.yview)
+        scrollbar = ttk.Scrollbar(table_body, orient=tk.VERTICAL, command=self.network_tree.yview)
         self.network_tree.configure(yscrollcommand=scrollbar.set)
         self.network_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.network_tree.bind("<<TreeviewSelect>>", self._analyzer_selection_changed)
         self.network_tree.bind("<Double-1>", self._track_tree_selection)
     def _build_hunter_tab(self) -> None:
         outer = ttk.Frame(self.hunter_tab, padding=12)
@@ -258,8 +280,8 @@ class WifiAnalyzerApp:
             if result.networks or not result.error:
                 self.networks = result.networks
                 self.network_by_bssid = {network.bssid: network for network in self.networks}
-                self._draw_plot()
                 self._refresh_network_table()
+                self._draw_plot()
                 self._refresh_target_controls()
             if self.tracking:
                 self._update_tracker_from_scan(result.networks)
@@ -307,51 +329,138 @@ class WifiAnalyzerApp:
             self.stop_tracking()
         self.start_analyzer_scan(force=True)
 
+    @staticmethod
+    def _channel_profile(x_values: np.ndarray, channel: int, width_mhz: int) -> np.ndarray:
+        """Return a compact bell with a rounded crown and steep finite sides."""
+        half_span = max(0.75, (float(width_mhz) / 20.0) * 1.8)
+        scaled_distance = np.abs(x_values - float(channel)) / half_span
+        inside = scaled_distance < (1.0 - 1e-12)
+        profile = np.zeros_like(x_values, dtype=float)
+        profile[inside] = np.cos(scaled_distance[inside] * np.pi / 2.0) ** 0.65
+        return profile
+
     def _draw_plot(self) -> None:
         axis = self.axis
         axis.clear()
-        axis.set_facecolor("black")
+        axis.set_facecolor("#080D10")
         band = self.band_var.get()
-        axis.set_title(f"Wi-Fi Channel Overlap ({band} GHz)", fontsize=11, color="white")
-        x_min, x_max, points = ((0.5, 14.5, 400) if band == "2.4" else (30, 177, 800))
+        axis.set_title(f"Wi-Fi Analyzer - {band} GHz", fontsize=15, color="#E6E6E6", pad=8)
+        selected_bssids = set(self.network_tree.selection())
+        has_selection = bool(selected_bssids)
+        x_min, x_max, points = ((0.5, 14.5, 700) if band == "2.4" else (30, 177, 1200))
         x_values = np.linspace(x_min, x_max, points)
         for network in self.networks:
             if not matches_band(network.channel, band):
                 continue
             strength = max(-100.0, min(-30.0, network.rssi))
-            sigma = max(0.5, (network.width / 20.0) * 1.2)
-            normalized = np.exp(-0.5 * ((x_values - network.channel) / sigma) ** 2)
+            normalized = self._channel_profile(x_values, network.channel, network.width)
             y_values = -100 + normalized * (strength + 100)
+            mask = normalized > 0
+
+            if np.any(mask):
+                indices = np.where(mask)[0]
+                first = indices[0]
+                last = indices[-1]
+
+                first = max(0, first - 1)
+                last = min(len(y_values) - 1, last + 1)
+
+                y_values[:first] = np.nan
+                y_values[last + 1:] = np.nan
             color = stable_color(network.bssid)
-            axis.fill_between(x_values, y_values, -100, color=color, alpha=0.5)
+
+            selected = network.bssid in selected_bssids
+            if not has_selection:
+                line_alpha = 0.88
+                fill_alpha = 0.14
+                text_alpha = 0.88
+                line_width = 2.0
+                zorder = 2
+            elif selected:
+                line_alpha = 1.0
+                fill_alpha = 0.28
+                text_alpha = 1.0
+                line_width = 3.2
+                zorder = 10
+            else:
+                line_alpha = 0.14
+                fill_alpha = 0.02
+                text_alpha = 0.10
+                line_width = 1.1
+                zorder = 1
+
+            axis.fill_between(
+                x_values,
+                y_values,
+                -100,
+                color=color,
+                alpha=fill_alpha,
+                linewidth=0,
+                zorder=zorder,
+            )
+            axis.plot(
+                x_values,
+                y_values,
+                color=color,
+                alpha=line_alpha,
+                linewidth=line_width,
+                zorder=zorder + 0.2,
+            )
             axis.text(
                 network.channel,
-                strength + 1.5,
-                f"{network.ssid}\n{network.bssid[-8:]}",
-                color="white",
+                strength + 1.8,
+                network.ssid,
+                color=color,
+                alpha=text_alpha,
                 ha="center",
                 va="bottom",
-                fontsize=7,
-                bbox=dict(facecolor=color, alpha=0.25, edgecolor="none"),
+                fontsize=9 if selected else 8,
+                fontweight="bold",
+                zorder=zorder + 1,
+            )
+            axis.text(
+                network.channel,
+                strength + 0.2,
+                network.bssid[-8:],
+                color=color,
+                alpha=text_alpha * 0.8,
+                ha="center",
+                va="bottom",
+                fontsize=6,
+                zorder=zorder + 1,
             )
         if band == "2.4":
             axis.set_xlim(0.5, 14.5)
             axis.set_xticks(range(1, 15))
         else:
             axis.set_xlim(30, 177)
-            common_channels = (range(30, 166, 10))
-            axis.set_xticks(common_channels)
-        axis.set_ylim(-100, -25)
-        axis.set_yticks(range(-100, -20, 10))
-        axis.set_xlabel("Wi-Fi channel", fontsize=9, color="white")
-        axis.set_ylabel("Signal strength (dBm)", fontsize=9, color="white")
-        axis.tick_params(colors="white")
-        axis.grid(True, color="gray", alpha=0.25)
+            axis.set_xticks(range(30, 166, 10))
+        axis.set_ylim(-100, -35)
+        axis.set_yticks(range(-100, -30, 10))
+        axis.set_xlabel("Channel", fontsize=10, color="#DDDDDD")
+        axis.set_ylabel("dBm", fontsize=10, color="#DDDDDD")
+        axis.yaxis.tick_right()
+        axis.yaxis.set_label_position("right")
+        axis.tick_params(colors="#CCCCCC")
+        axis.grid(True, color="#667078", alpha=0.28, linewidth=0.8)
         for spine in axis.spines.values():
-            spine.set_color("#777777")
+            spine.set_color("#8A8A8A")
         self.plot_canvas.draw_idle()
+
+    def _analyzer_selection_changed(self, _event=None) -> None:
+        """Redraw the analyzer to emphasize selected access-point radios."""
+        self._draw_plot()
+
+    def _clear_analyzer_selection(self) -> None:
+        """Restore the analyzer to its unfiltered view."""
+        selection = self.network_tree.selection()
+        if selection:
+            self.network_tree.selection_remove(*selection)
+        self._draw_plot()
+
     def _refresh_network_table(self) -> None:
         """Update changed rows in place instead of rebuilding the Treeview."""
+        selected_bssids = set(self.network_tree.selection())
         desired = {network.bssid: network for network in self.networks}
         existing = set(self.network_tree.get_children())
         for stale in existing - desired.keys():
@@ -364,6 +473,9 @@ class WifiAnalyzerApp:
                 self.network_tree.move(network.bssid, "", position)
             else:
                 self.network_tree.insert("", position, iid=network.bssid, values=values)
+        for bssid in selected_bssids:
+            if self.network_tree.exists(bssid):
+                self.network_tree.selection_add(bssid)
 
     def _refresh_target_controls(self) -> None:
         # Keep the locked target visible while hunting, even if one scan misses it.
